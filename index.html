@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>A02 Task Manager | Design Exploration</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📋</text></svg>">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,500;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    * { font-family: 'DM Sans', sans-serif; }
+    .font-mono { font-family: 'JetBrains Mono', monospace; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes slideIn { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: scale(1); } }
+    .animate-fade { animation: fadeIn 0.3s ease-out; }
+    .animate-slide { animation: slideIn 0.25s ease-out; }
+    .line-clamp-2 { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .drop-zone { transition: all 0.2s ease; }
+    .drop-zone.drag-over { border-color: #38bdf8; background: #f0f9ff; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    // ╔══════════════════════════════════════════════════════════════════╗
+    // ║  SUPABASE CONFIG — PASTE YOUR KEYS HERE                        ║
+    // ╚══════════════════════════════════════════════════════════════════╝
+    const SUPABASE_URL = "https://mqlsqpdujypmavdjtfki.supabase.co";           // e.g. https://abcdefg.supabase.co
+    const SUPABASE_ANON_KEY = sb_publishable_-mmgGNpILqC0ULgLuoP5GA_Sv-644UT; // the long anon/public key
+
+    const LECTURER_CODE = "DEXPLORE2026";
+    const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+    const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+    const isConfigured = SUPABASE_URL !== "YOUR_SUPABASE_URL" && SUPABASE_ANON_KEY !== "YOUR_SUPABASE_ANON_KEY";
+    let supabase = null;
+    if (isConfigured) {
+      supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    }
+
+    const STATUS_LABELS = { todo: "To Do", "in-progress": "In Progress", review: "For Review", done: "Done" };
+    const STATUS_COLORS = {
+      todo:          { bg: "bg-amber-50",   dot: "bg-amber-400",   text: "text-amber-700" },
+      "in-progress": { bg: "bg-sky-50",     dot: "bg-sky-400",     text: "text-sky-700" },
+      review:        { bg: "bg-violet-50",  dot: "bg-violet-400",  text: "text-violet-700" },
+      done:          { bg: "bg-emerald-50", dot: "bg-emerald-400", text: "text-emerald-700" },
+    };
+
+    const generateId = () => crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substr(2, 12);
+    const formatDate = (d) => { if (!d) return ""; return new Date(d + "T00:00:00").toLocaleDateString("en-SG", { day: "numeric", month: "short" }); };
+    const isOverdue = (d) => { if (!d) return false; return new Date(d + "T23:59:59") < new Date(); };
+    const isImageUrl = (url) => { if (!url) return false; return url.includes("supabase") || /\.(jpg|jpeg|png|gif|webp)(\?|$)/i.test(url); };
+
+    // ── DB Helpers ──
+    async function dbGetGroup(code) { const { data } = await supabase.from("groups").select("*").eq("code", code).single(); return data || null; }
+    async function dbCreateGroup(code, name, members) { const { data, error } = await supabase.from("groups").insert([{ code, name, members }]).select().single(); if (error) { console.error(error); return null; } return data; }
+    async function dbGetTasks(groupCode) { const { data } = await supabase.from("tasks").select("*").eq("group_code", groupCode).order("created_at", { ascending: true }); return data || []; }
+    async function dbUpsertTask(task) { const { data, error } = await supabase.from("tasks").upsert([task]).select().single(); if (error) { console.error(error); return null; } return data; }
+    async function dbDeleteTask(id) { const { error } = await supabase.from("tasks").delete().eq("id", id); return !error; }
+    async function dbGetAllGroups() { const { data } = await supabase.from("groups").select("*").order("created_at", { ascending: true }); return data || []; }
+
+    // ── Storage ──
+    async function uploadImage(file, groupCode) {
+      const ext = file.name.split(".").pop().toLowerCase();
+      const fileName = `${groupCode}/${generateId()}.${ext}`;
+      const { error } = await supabase.storage.from("wip-uploads").upload(fileName, file, { cacheControl: "3600", upsert: false });
+      if (error) { console.error("Upload error:", error); return null; }
+      const { data: urlData } = supabase.storage.from("wip-uploads").getPublicUrl(fileName);
+      return urlData?.publicUrl || null;
+    }
+
+    // ─── Setup Screen ───
+    function SetupInstructions() {
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 to-stone-100 flex items-center justify-center p-6">
+          <div className="bg-white rounded-2xl shadow-xl border border-gray-100 max-w-2xl w-full p-8 animate-fade">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="w-12 h-12 bg-emerald-50 rounded-xl flex items-center justify-center"><span className="text-2xl">🔧</span></div>
+              <div>
+                <h1 className="text-xl font-bold text-gray-900">Setup Required</h1>
+                <p className="text-sm text-gray-500">Connect Supabase to get started (about 10 minutes)</p>
+              </div>
+            </div>
+            <div className="space-y-5 text-sm text-gray-700">
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-4">
+                <p className="font-semibold text-amber-800 mb-1">⚡ One-time setup</p>
+                <p className="text-amber-700">You only need to do this once. After that, students just visit the link.</p>
+              </div>
+              <div className="space-y-4">
+                <div className="flex gap-3">
+                  <span className="shrink-0 w-7 h-7 rounded-full bg-gray-900 text-white text-xs font-bold flex items-center justify-center">1</span>
+                  <div><p className="font-semibold">Create a Supabase account</p><p className="text-gray-500">Go to <a href="https://supabase.com" target="_blank" className="text-blue-600 underline">supabase.com</a> and sign up (free). Create a new project.</p></div>
+                </div>
+                <div className="flex gap-3">
+                  <span className="shrink-0 w-7 h-7 rounded-full bg-gray-900 text-white text-xs font-bold flex items-center justify-center">2</span>
+                  <div>
+                    <p className="font-semibold">Create the database tables and storage</p>
+                    <p className="text-gray-500 mb-2">Go to <strong>SQL Editor</strong> in your Supabase dashboard and run this:</p>
+                    <pre className="bg-gray-900 text-green-400 text-xs p-4 rounded-xl overflow-x-auto whitespace-pre font-mono leading-relaxed">{`-- Groups table
+create table groups (
+  id uuid default gen_random_uuid() primary key,
+  code text unique not null,
+  name text not null,
+  members jsonb not null default '[]',
+  created_at timestamptz default now()
+);
+
+-- Tasks table
+create table tasks (
+  id uuid default gen_random_uuid() primary key,
+  group_code text not null references groups(code),
+  title text not null,
+  description text default '',
+  status text default 'todo',
+  assignee text default '',
+  due_date date,
+  updates jsonb default '[]',
+  created_at timestamptz default now()
+);
+
+-- Enable public read/write
+alter table groups enable row level security;
+alter table tasks enable row level security;
+
+create policy "Public access groups"
+  on groups for all using (true) with check (true);
+
+create policy "Public access tasks"
+  on tasks for all using (true) with check (true);
+
+-- Storage bucket for WIP image uploads
+insert into storage.buckets (id, name, public)
+  values ('wip-uploads', 'wip-uploads', true);
+
+create policy "Public upload wip"
+  on storage.objects for insert
+  with check (bucket_id = 'wip-uploads');
+
+create policy "Public read wip"
+  on storage.objects for select
+  using (bucket_id = 'wip-uploads');
+
+create policy "Public delete wip"
+  on storage.objects for delete
+  using (bucket_id = 'wip-uploads');`}</pre>
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                  <span className="shrink-0 w-7 h-7 rounded-full bg-gray-900 text-white text-xs font-bold flex items-center justify-center">3</span>
+                  <div><p className="font-semibold">Copy your project keys</p><p className="text-gray-500">Go to <strong>Settings → API</strong>. Copy the <strong>Project URL</strong> and the <strong>anon public</strong> key.</p></div>
+                </div>
+                <div className="flex gap-3">
+                  <span className="shrink-0 w-7 h-7 rounded-full bg-gray-900 text-white text-xs font-bold flex items-center justify-center">4</span>
+                  <div>
+                    <p className="font-semibold">Paste them into this file</p>
+                    <p className="text-gray-500">Open <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs font-mono">index.html</code> and replace these two lines near the top:</p>
+                    <pre className="bg-gray-100 text-gray-800 text-xs p-3 rounded-xl font-mono mt-1">{`const SUPABASE_URL = "YOUR_SUPABASE_URL";
+const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";`}</pre>
+                  </div>
+                </div>
+                <div className="flex gap-3">
+                  <span className="shrink-0 w-7 h-7 rounded-full bg-gray-900 text-white text-xs font-bold flex items-center justify-center">5</span>
+                  <div><p className="font-semibold">Push to GitHub and enable Pages</p><p className="text-gray-500">Create a repo, upload this file as <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs font-mono">index.html</code>, go to <strong>Settings → Pages</strong>, set source to main branch.</p></div>
+                </div>
+              </div>
+              <div className="bg-sky-50 border border-sky-200 rounded-xl p-4">
+                <p className="font-semibold text-sky-800 mb-1">📸 Image uploads included</p>
+                <p className="text-sky-700">Students can drag and drop WIP screenshots directly (up to 5MB each, 1GB total storage free). Videos should be linked from Google Drive or YouTube.</p>
+              </div>
+              <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4">
+                <p className="font-semibold text-emerald-800">✓ That's it!</p>
+                <p className="text-emerald-700">Share the GitHub Pages URL with students. They enter a group code and they're in.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Modal ───
+    function Modal({ open, onClose, title, children }) {
+      if (!open) return null;
+      return (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" onClick={onClose}>
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" />
+          <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[90vh] overflow-y-auto animate-slide" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between p-5 border-b border-gray-100 sticky top-0 bg-white rounded-t-2xl z-10">
+              <h3 className="text-lg font-bold text-gray-900">{title}</h3>
+              <button onClick={onClose} className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors">✕</button>
+            </div>
+            <div className="p-5">{children}</div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Lightbox ───
+    function Lightbox({ src, onClose }) {
+      if (!src) return null;
+      return (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/80 backdrop-blur-md" onClick={onClose}>
+          <button onClick={onClose} className="absolute top-4 right-4 w-10 h-10 flex items-center justify-center rounded-full bg-white/20 hover:bg-white/30 text-white text-xl transition-colors">✕</button>
+          <img src={src} className="max-w-full max-h-[90vh] rounded-lg shadow-2xl object-contain" onClick={e => e.stopPropagation()} />
+        </div>
+      );
+    }
+
+    // ─── Task Card ───
+    function TaskCard({ task, onEdit }) {
+      const colors = STATUS_COLORS[task.status];
+      const overdue = task.status !== "done" && isOverdue(task.due_date);
+      const imgCount = (task.updates || []).filter(u => isImageUrl(u.imageUrl)).length;
+      const lastImg = [...(task.updates || [])].reverse().find(u => isImageUrl(u.imageUrl));
+
+      return (
+        <div onClick={() => onEdit(task)} className={`group bg-white rounded-xl border ${overdue ? "border-red-300 shadow-red-100/50" : "border-gray-150 hover:border-gray-300"} shadow-sm hover:shadow-md transition-all cursor-pointer p-4 animate-fade`}>
+          {lastImg && (
+            <div className="mb-3 rounded-lg overflow-hidden bg-gray-100 h-32">
+              <img src={lastImg.imageUrl} className="w-full h-full object-cover" alt="WIP" loading="lazy" />
+            </div>
+          )}
+          <div className="flex items-start justify-between gap-2 mb-2">
+            <h4 className="text-sm font-semibold text-gray-900 leading-snug flex-1">{task.title}</h4>
+            <span className={`shrink-0 inline-flex items-center gap-1.5 text-xs font-medium px-2 py-0.5 rounded-full ${colors.bg} ${colors.text}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${colors.dot}`} />{STATUS_LABELS[task.status]}
+            </span>
+          </div>
+          {task.description && <p className="text-xs text-gray-500 mb-3 line-clamp-2">{task.description}</p>}
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              {task.assignee && (
+                <span className="inline-flex items-center gap-1 text-xs text-gray-500 bg-gray-50 px-2 py-0.5 rounded-full">
+                  <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
+                  {task.assignee}
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-2">
+              {imgCount > 0 && <span className="inline-flex items-center gap-1 text-xs text-gray-400"><svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>{imgCount}</span>}
+              {(task.updates || []).length > 0 && <span className="text-xs text-gray-400">{(task.updates || []).length} WIP</span>}
+              {task.due_date && <span className={`text-xs font-medium ${overdue ? "text-red-500" : "text-gray-400"}`}>{overdue && "⚠ "}{formatDate(task.due_date)}</span>}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Kanban ───
+    function KanbanView({ tasks, onEdit }) {
+      return (
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 h-full min-h-0">
+          {["todo","in-progress","review","done"].map(status => {
+            const c = STATUS_COLORS[status], ct = tasks.filter(t => t.status === status);
+            return (
+              <div key={status} className="flex flex-col min-h-0">
+                <div className="flex items-center gap-2 mb-3 px-1">
+                  <span className={`w-2.5 h-2.5 rounded-full ${c.dot}`} />
+                  <span className="text-sm font-bold text-gray-700">{STATUS_LABELS[status]}</span>
+                  <span className="text-xs text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded-full">{ct.length}</span>
+                </div>
+                <div className="flex-1 space-y-3 overflow-y-auto pr-1 pb-4">
+                  {ct.map(t => <TaskCard key={t.id} task={t} onEdit={onEdit} />)}
+                  {ct.length === 0 && <div className="text-center py-10 text-gray-300 text-sm">No tasks</div>}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+    }
+
+    // ─── Calendar ───
+    function CalendarView({ tasks, onEdit }) {
+      const [month, setMonth] = useState(() => { const n = new Date(); return new Date(n.getFullYear(), n.getMonth(), 1); });
+      const dim = new Date(month.getFullYear(), month.getMonth()+1, 0).getDate();
+      const sd = new Date(month.getFullYear(), month.getMonth(), 1).getDay();
+      const days = []; for (let i=0;i<sd;i++) days.push(null); for (let i=1;i<=dim;i++) days.push(i);
+      const tfd = (day) => { if (!day) return []; const ds=`${month.getFullYear()}-${String(month.getMonth()+1).padStart(2,"0")}-${String(day).padStart(2,"0")}`; return tasks.filter(t=>t.due_date===ds); };
+      const today = new Date();
+      const isToday = (d) => d && today.getFullYear()===month.getFullYear() && today.getMonth()===month.getMonth() && today.getDate()===d;
+
+      return (
+        <div className="animate-fade">
+          <div className="flex items-center justify-between mb-4">
+            <button onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth()-1, 1))} className="p-2 hover:bg-gray-100 rounded-lg text-gray-500"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg></button>
+            <h3 className="text-lg font-bold text-gray-800">{month.toLocaleDateString("en-SG",{month:"long",year:"numeric"})}</h3>
+            <button onClick={() => setMonth(new Date(month.getFullYear(), month.getMonth()+1, 1))} className="p-2 hover:bg-gray-100 rounded-lg text-gray-500"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg></button>
+          </div>
+          <div className="grid grid-cols-7 gap-px bg-gray-200 rounded-xl overflow-hidden border border-gray-200">
+            {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d => <div key={d} className="bg-gray-50 text-center text-xs font-bold text-gray-500 py-2.5">{d}</div>)}
+            {days.map((day,i) => { const dt=tfd(day); return (
+              <div key={i} className={`bg-white min-h-[90px] p-1.5 ${!day?"bg-gray-50":""}`}>{day && (<>
+                <div className={`text-xs font-medium mb-1 w-6 h-6 flex items-center justify-center rounded-full ${isToday(day)?"bg-sky-500 text-white":"text-gray-500"}`}>{day}</div>
+                <div className="space-y-0.5">{dt.slice(0,3).map(t => { const c=STATUS_COLORS[t.status]; return <div key={t.id} onClick={()=>onEdit(t)} className={`text-xs px-1.5 py-0.5 rounded cursor-pointer truncate ${c.bg} ${c.text} hover:opacity-80`}>{t.title}</div>; })}{dt.length>3 && <div className="text-xs text-gray-400 pl-1">+{dt.length-3}</div>}</div>
+              </>)}</div>
+            ); })}
+          </div>
+        </div>
+      );
+    }
+
+    // ─── List ───
+    function ListView({ tasks, onEdit }) {
+      const [sortBy, setSortBy] = useState("due_date");
+      const sorted = [...tasks].sort((a,b) => {
+        if (sortBy==="due_date") return (a.due_date||"9999")>(b.due_date||"9999")?1:-1;
+        if (sortBy==="status"){const o={todo:0,"in-progress":1,review:2,done:3};return o[a.status]-o[b.status];}
+        if (sortBy==="assignee") return (a.assignee||"zzz").localeCompare(b.assignee||"zzz");
+        return 0;
+      });
+      return (
+        <div className="animate-fade">
+          <div className="flex items-center gap-2 mb-3">
+            <span className="text-xs text-gray-500 font-medium">Sort:</span>
+            {[["due_date","Due Date"],["status","Status"],["assignee","Assignee"]].map(([k,l])=>(
+              <button key={k} onClick={()=>setSortBy(k)} className={`text-xs px-2.5 py-1 rounded-full font-medium transition-colors ${sortBy===k?"bg-gray-900 text-white":"bg-gray-100 text-gray-500 hover:bg-gray-200"}`}>{l}</button>
+            ))}
+          </div>
+          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+            <div className="hidden md:grid grid-cols-12 gap-2 px-4 py-2.5 bg-gray-50 border-b border-gray-200 text-xs font-bold text-gray-500 uppercase tracking-wide">
+              <div className="col-span-5">Task</div><div className="col-span-2">Status</div><div className="col-span-2">Assignee</div><div className="col-span-2">Due</div><div className="col-span-1">WIP</div>
+            </div>
+            {sorted.map(task => { const c=STATUS_COLORS[task.status], od=task.status!=="done"&&isOverdue(task.due_date); return (
+              <div key={task.id} onClick={()=>onEdit(task)} className="grid grid-cols-1 md:grid-cols-12 gap-1 md:gap-2 px-4 py-3 border-b border-gray-50 hover:bg-gray-50 cursor-pointer transition-colors items-center">
+                <div className="md:col-span-5"><div className="text-sm font-semibold text-gray-900 truncate">{task.title}</div>{task.description&&<div className="text-xs text-gray-400 truncate">{task.description}</div>}</div>
+                <div className="md:col-span-2"><span className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full ${c.bg} ${c.text}`}><span className={`w-1.5 h-1.5 rounded-full ${c.dot}`}/>{STATUS_LABELS[task.status]}</span></div>
+                <div className="md:col-span-2 text-sm text-gray-600">{task.assignee||"\u2014"}</div>
+                <div className={`md:col-span-2 text-sm ${od?"text-red-500 font-semibold":"text-gray-500"}`}>{task.due_date?formatDate(task.due_date):"\u2014"}</div>
+                <div className="md:col-span-1 text-xs text-gray-400">{(task.updates||[]).length}</div>
+              </div>
+            ); })}
+            {sorted.length===0&&<div className="text-center py-14 text-gray-300 text-sm">No tasks yet</div>}
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Task Editor ───
+    function TaskEditor({ task, members, groupCode, onSave, onDelete, onClose }) {
+      const isNew = !task;
+      const [form, setForm] = useState(task ? {...task, updates: task.updates||[]} : {title:"",description:"",status:"todo",assignee:"",due_date:"",updates:[]});
+      const [newUpdate, setNewUpdate] = useState("");
+      const [linkUrl, setLinkUrl] = useState("");
+      const [saving, setSaving] = useState(false);
+      const [uploading, setUploading] = useState(false);
+      const [uploadError, setUploadError] = useState("");
+      const [dragOver, setDragOver] = useState(false);
+      const [lightboxSrc, setLightboxSrc] = useState(null);
+      const fileInputRef = useRef(null);
+
+      const handleSave = async () => { if (!form.title.trim()||saving) return; setSaving(true); await onSave(form); setSaving(false); };
+
+      const handleImageUpload = async (files) => {
+        setUploadError("");
+        const valid = Array.from(files).filter(f => {
+          if (!ALLOWED_IMAGE_TYPES.includes(f.type)) { setUploadError(`${f.name}: Only JPG, PNG, GIF, WebP allowed`); return false; }
+          if (f.size > MAX_IMAGE_SIZE) { setUploadError(`${f.name}: Max 5MB per image`); return false; }
+          return true;
+        });
+        if (!valid.length) return;
+        setUploading(true);
+        const newUpdates = [];
+        for (const file of valid) {
+          const url = await uploadImage(file, groupCode);
+          if (url) newUpdates.push({ id: generateId(), text: "", imageUrl: url, fileName: file.name, timestamp: new Date().toISOString() });
+          else setUploadError(`Failed to upload ${file.name}`);
+        }
+        if (newUpdates.length) setForm(f => ({...f, updates: [...f.updates, ...newUpdates]}));
+        setUploading(false);
+      };
+
+      const handleDrop = (e) => { e.preventDefault(); setDragOver(false); if (e.dataTransfer.files.length) handleImageUpload(e.dataTransfer.files); };
+
+      const addTextUpdate = () => {
+        if (!newUpdate.trim()&&!linkUrl.trim()) return;
+        setForm(f => ({...f, updates: [...f.updates, {id:generateId(),text:newUpdate.trim(),imageUrl:linkUrl.trim()||"",timestamp:new Date().toISOString()}]}));
+        setNewUpdate(""); setLinkUrl("");
+      };
+
+      const removeUpdate = (uid) => setForm(f => ({...f, updates: f.updates.filter(u => u.id!==uid)}));
+
+      return (
+        <div className="space-y-4">
+          <Lightbox src={lightboxSrc} onClose={() => setLightboxSrc(null)} />
+          <div>
+            <label className="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-wide">Title</label>
+            <input value={form.title} onChange={e=>setForm(f=>({...f,title:e.target.value}))} placeholder="What needs to be done?" className="w-full px-3 py-2.5 rounded-lg border border-gray-200 focus:border-sky-400 focus:ring-2 focus:ring-sky-100 outline-none text-sm" />
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-wide">Description</label>
+            <textarea value={form.description} onChange={e=>setForm(f=>({...f,description:e.target.value}))} placeholder="Details, references, notes..." rows={3} className="w-full px-3 py-2.5 rounded-lg border border-gray-200 focus:border-sky-400 focus:ring-2 focus:ring-sky-100 outline-none text-sm resize-none" />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-wide">Status</label>
+              <select value={form.status} onChange={e=>setForm(f=>({...f,status:e.target.value}))} className="w-full px-3 py-2.5 rounded-lg border border-gray-200 focus:border-sky-400 outline-none text-sm bg-white">
+                {Object.entries(STATUS_LABELS).map(([k,v])=><option key={k} value={k}>{v}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-wide">Due Date</label>
+              <input type="date" value={form.due_date||""} onChange={e=>setForm(f=>({...f,due_date:e.target.value||null}))} className="w-full px-3 py-2.5 rounded-lg border border-gray-200 focus:border-sky-400 outline-none text-sm" />
+            </div>
+          </div>
+          <div>
+            <label className="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-wide">Assign To</label>
+            <select value={form.assignee} onChange={e=>setForm(f=>({...f,assignee:e.target.value}))} className="w-full px-3 py-2.5 rounded-lg border border-gray-200 focus:border-sky-400 outline-none text-sm bg-white">
+              <option value="">Unassigned</option>
+              {members.map(m=><option key={m} value={m}>{m}</option>)}
+            </select>
+          </div>
+
+          {/* WIP Section */}
+          <div>
+            <label className="block text-xs font-bold text-gray-500 mb-2 uppercase tracking-wide">Work in Progress</label>
+            {form.updates.length > 0 && (
+              <div className="space-y-2 mb-3 max-h-64 overflow-y-auto">
+                {form.updates.map(u => (
+                  <div key={u.id} className="bg-gray-50 rounded-lg p-3 text-sm relative group">
+                    <button onClick={()=>removeUpdate(u.id)} className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition-all text-xs z-10">✕</button>
+                    {u.text && <p className="text-gray-700 mb-2">{u.text}</p>}
+                    {u.imageUrl && isImageUrl(u.imageUrl) ? (
+                      <div className="rounded-lg overflow-hidden bg-gray-200 cursor-pointer" onClick={()=>setLightboxSrc(u.imageUrl)}>
+                        <img src={u.imageUrl} className="w-full max-h-48 object-cover hover:opacity-90 transition-opacity" alt={u.fileName||"WIP"} loading="lazy" />
+                      </div>
+                    ) : u.imageUrl ? (
+                      <a href={u.imageUrl} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-sky-500 hover:text-sky-600 text-xs break-all underline">
+                        <svg className="w-3 h-3 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" /></svg>
+                        {u.imageUrl}
+                      </a>
+                    ) : null}
+                    <p className="text-xs text-gray-400 mt-1.5">{new Date(u.timestamp).toLocaleString("en-SG")}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Drop zone */}
+            <div
+              className={`drop-zone border-2 border-dashed rounded-xl p-4 text-center cursor-pointer mb-3 ${dragOver?"drag-over border-sky-400 bg-sky-50":"border-gray-200 hover:border-gray-300 bg-gray-50/50"}`}
+              onDragOver={e=>{e.preventDefault();setDragOver(true);}} onDragLeave={()=>setDragOver(false)} onDrop={handleDrop}
+              onClick={()=>fileInputRef.current?.click()}
+            >
+              <input ref={fileInputRef} type="file" accept="image/jpeg,image/png,image/gif,image/webp" multiple className="hidden" onChange={e=>{if(e.target.files.length)handleImageUpload(e.target.files);e.target.value="";}} />
+              {uploading ? (
+                <div className="flex items-center justify-center gap-2 py-2">
+                  <div className="w-4 h-4 border-2 border-sky-400 border-t-transparent rounded-full animate-spin" />
+                  <span className="text-sm text-sky-600 font-medium">Uploading...</span>
+                </div>
+              ) : (
+                <>
+                  <svg className="w-8 h-8 text-gray-300 mx-auto mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                  <p className="text-xs text-gray-500"><span className="font-semibold text-sky-500">Click to upload</span> or drag and drop screenshots</p>
+                  <p className="text-xs text-gray-400 mt-0.5">JPG, PNG, GIF, WebP (max 5MB each)</p>
+                </>
+              )}
+            </div>
+            {uploadError && <p className="text-red-500 text-xs mb-2">{uploadError}</p>}
+
+            {/* Text + link */}
+            <textarea value={newUpdate} onChange={e=>setNewUpdate(e.target.value)} placeholder="Add a text note about your progress..." rows={2} className="w-full px-3 py-2 rounded-lg border border-gray-200 focus:border-sky-400 outline-none text-sm resize-none" />
+            <input value={linkUrl} onChange={e=>setLinkUrl(e.target.value)} placeholder="Paste a link (Google Drive video, YouTube, etc.)" className="w-full mt-2 px-3 py-2 rounded-lg border border-gray-200 focus:border-sky-400 outline-none text-sm" />
+            <button onClick={addTextUpdate} disabled={!newUpdate.trim()&&!linkUrl.trim()} className="mt-2 text-xs font-semibold px-3 py-1.5 rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-600 disabled:opacity-40 transition-colors">+ Add Note / Link</button>
+          </div>
+
+          <div className="flex items-center justify-between pt-3 border-t border-gray-100">
+            {!isNew && <button onClick={()=>onDelete(task.id)} className="text-sm text-red-400 hover:text-red-600 transition-colors">Delete</button>}
+            <div className="flex items-center gap-2 ml-auto">
+              <button onClick={onClose} className="text-sm px-4 py-2 rounded-lg text-gray-500 hover:bg-gray-100 transition-colors">Cancel</button>
+              <button onClick={handleSave} disabled={!form.title.trim()||saving} className="text-sm font-semibold px-5 py-2 rounded-lg bg-gray-900 text-white hover:bg-gray-800 disabled:opacity-40 transition-colors">
+                {saving?"Saving...":isNew?"Create Task":"Save Changes"}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Group Setup ───
+    function GroupSetup({ code, onComplete }) {
+      const [name, setName] = useState(""); const [members, setMembers] = useState(["","","",""]); const [creating, setCreating] = useState(false); const [error, setError] = useState("");
+      const addMember = () => { if (members.length<6) setMembers([...members,""]); };
+      const removeMember = (i) => { if (members.length>2) setMembers(members.filter((_,idx)=>idx!==i)); };
+      const handleCreate = async () => {
+        const filtered = members.filter(m=>m.trim());
+        if (!name.trim()||filtered.length<2||creating) return;
+        setCreating(true); setError("");
+        const result = await dbCreateGroup(code, name.trim(), filtered);
+        setCreating(false);
+        if (result) onComplete(result); else setError("Failed to create group. Code may already be taken.");
+      };
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 to-stone-100 flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-xl border border-gray-100 w-full max-w-md p-8 animate-fade">
+            <div className="text-center mb-6">
+              <div className="w-12 h-12 bg-sky-50 rounded-xl flex items-center justify-center mx-auto mb-3"><svg className="w-6 h-6 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" /></svg></div>
+              <h2 className="text-xl font-bold text-gray-900">Set Up Your Group</h2>
+              <p className="text-sm text-gray-500 mt-1">Code: <span className="font-mono font-semibold text-gray-700">{code}</span></p>
+            </div>
+            <div className="space-y-4">
+              <div><label className="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-wide">Group Name</label><input value={name} onChange={e=>setName(e.target.value)} placeholder="e.g. Team Laksa" className="w-full px-3 py-2.5 rounded-lg border border-gray-200 focus:border-sky-400 focus:ring-2 focus:ring-sky-100 outline-none text-sm" /></div>
+              <div>
+                <label className="block text-xs font-bold text-gray-500 mb-1 uppercase tracking-wide">Members ({members.length}/6)</label>
+                <div className="space-y-2">{members.map((m,i) => (
+                  <div key={i} className="flex gap-2"><input value={m} onChange={e=>{const n=[...members];n[i]=e.target.value;setMembers(n);}} placeholder={`Member ${i+1}`} className="flex-1 px-3 py-2 rounded-lg border border-gray-200 focus:border-sky-400 outline-none text-sm" />{members.length>2&&<button onClick={()=>removeMember(i)} className="w-9 h-9 flex items-center justify-center rounded-lg hover:bg-red-50 text-gray-300 hover:text-red-400 transition-colors">✕</button>}</div>
+                ))}</div>
+                {members.length<6&&<button onClick={addMember} className="mt-2 text-xs text-sky-500 hover:text-sky-600 font-semibold">+ Add member</button>}
+              </div>
+              {error&&<p className="text-red-500 text-xs">{error}</p>}
+              <button onClick={handleCreate} disabled={!name.trim()||members.filter(m=>m.trim()).length<2||creating} className="w-full py-3 rounded-xl bg-gray-900 text-white font-bold text-sm hover:bg-gray-800 disabled:opacity-40 transition-all mt-2">{creating?"Creating...":"Create Group"}</button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Group Workspace ───
+    function GroupWorkspace({ groupInfo, onLogout, isLecturer }) {
+      const [tasks, setTasks] = useState([]); const [viewMode, setViewMode] = useState("kanban"); const [editingTask, setEditingTask] = useState(null); const [showNewTask, setShowNewTask] = useState(false); const [loading, setLoading] = useState(true);
+      const loadTasks = useCallback(async () => { setTasks(await dbGetTasks(groupInfo.code)); setLoading(false); }, [groupInfo.code]);
+      useEffect(() => { loadTasks(); }, [loadTasks]);
+      useEffect(() => {
+        const ch = supabase.channel(`tasks-${groupInfo.code}`).on("postgres_changes",{event:"*",schema:"public",table:"tasks",filter:`group_code=eq.${groupInfo.code}`},()=>loadTasks()).subscribe();
+        return () => supabase.removeChannel(ch);
+      }, [groupInfo.code, loadTasks]);
+
+      const handleSaveTask = async (form) => {
+        await dbUpsertTask({...(form.id?{id:form.id}:{}),group_code:groupInfo.code,title:form.title,description:form.description||"",status:form.status,assignee:form.assignee||"",due_date:form.due_date||null,updates:form.updates||[]});
+        await loadTasks(); setEditingTask(null); setShowNewTask(false);
+      };
+      const handleDeleteTask = async (id) => { await dbDeleteTask(id); await loadTasks(); setEditingTask(null); };
+
+      if (loading) return <div className="min-h-screen bg-gradient-to-br from-slate-50 to-stone-100 flex items-center justify-center"><div className="text-gray-400 text-sm animate-pulse">Loading tasks...</div></div>;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 to-stone-100 flex flex-col">
+          <header className="bg-white/90 backdrop-blur-md border-b border-gray-200 sticky top-0 z-30">
+            <div className="max-w-7xl mx-auto px-4 md:px-6 py-3 flex items-center justify-between flex-wrap gap-2">
+              <div><h1 className="text-lg font-bold text-gray-900">{groupInfo.name}</h1><p className="text-xs text-gray-500">{groupInfo.members.join(" \u2022 ")}</p></div>
+              <div className="flex items-center gap-2 md:gap-3 flex-wrap">
+                <div className="flex items-center bg-gray-100 rounded-lg p-0.5">
+                  {[["kanban","Board"],["calendar","Calendar"],["list","List"]].map(([k,l])=>(
+                    <button key={k} onClick={()=>setViewMode(k)} className={`text-xs font-semibold px-3 py-1.5 rounded-md transition-all ${viewMode===k?"bg-white text-gray-900 shadow-sm":"text-gray-500 hover:text-gray-700"}`}>{l}</button>
+                  ))}
+                </div>
+                {!isLecturer&&<button onClick={()=>setShowNewTask(true)} className="flex items-center gap-1.5 text-sm font-semibold px-4 py-2 rounded-lg bg-gray-900 text-white hover:bg-gray-800 transition-colors"><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>New Task</button>}
+                <button onClick={onLogout} className="text-xs text-gray-400 hover:text-gray-600 transition-colors">{isLecturer?"← Back":"Exit"}</button>
+              </div>
+            </div>
+          </header>
+          <div className="flex-1 max-w-7xl mx-auto w-full px-4 md:px-6 py-5">
+            {viewMode==="kanban"&&<KanbanView tasks={tasks} onEdit={setEditingTask} />}
+            {viewMode==="calendar"&&<CalendarView tasks={tasks} onEdit={setEditingTask} />}
+            {viewMode==="list"&&<ListView tasks={tasks} onEdit={setEditingTask} />}
+          </div>
+          <Modal open={!!editingTask} onClose={()=>setEditingTask(null)} title="Edit Task">
+            {editingTask&&<TaskEditor task={editingTask} members={groupInfo.members} groupCode={groupInfo.code} onSave={handleSaveTask} onDelete={handleDeleteTask} onClose={()=>setEditingTask(null)} />}
+          </Modal>
+          <Modal open={showNewTask} onClose={()=>setShowNewTask(false)} title="New Task">
+            <TaskEditor task={null} members={groupInfo.members} groupCode={groupInfo.code} onSave={handleSaveTask} onDelete={()=>{}} onClose={()=>setShowNewTask(false)} />
+          </Modal>
+        </div>
+      );
+    }
+
+    // ─── Lecturer Dashboard ───
+    function LecturerDashboard({ onViewGroup, onLogout }) {
+      const [groups, setGroups] = useState([]); const [groupTasks, setGroupTasks] = useState({}); const [loading, setLoading] = useState(true);
+      useEffect(() => { (async () => { const ag=await dbGetAllGroups(); const tm={}; for(const g of ag) tm[g.code]=await dbGetTasks(g.code); setGroups(ag); setGroupTasks(tm); setLoading(false); })(); }, []);
+      if (loading) return <div className="min-h-screen bg-gradient-to-br from-slate-50 to-stone-100 flex items-center justify-center"><div className="text-gray-400 text-sm animate-pulse">Loading groups...</div></div>;
+      const all = Object.values(groupTasks).flat();
+      const totalTasks=all.length, totalDone=all.filter(t=>t.status==="done").length, overdue=all.filter(t=>t.status!=="done"&&isOverdue(t.due_date)).length;
+
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 to-stone-100">
+          <header className="bg-white/90 backdrop-blur-md border-b border-gray-200 sticky top-0 z-30">
+            <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+              <div><h1 className="text-xl font-bold text-gray-900">A02 Lecturer Overview</h1><p className="text-xs text-gray-500 mt-0.5">Design Exploration | {groups.length} groups</p></div>
+              <button onClick={onLogout} className="text-sm text-gray-400 hover:text-gray-600 transition-colors">Sign out</button>
+            </div>
+          </header>
+          <div className="max-w-6xl mx-auto px-6 py-6">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8">
+              {[{label:"Total Tasks",value:totalTasks,sub:`${totalDone} completed`,accent:"text-sky-600"},{label:"Completion",value:totalTasks?Math.round((totalDone/totalTasks)*100)+"%":"N/A",sub:`across ${groups.length} groups`,accent:"text-emerald-600"},{label:"Overdue",value:overdue,sub:"need attention",accent:"text-red-500"}].map(s=>(
+                <div key={s.label} className="bg-white rounded-xl border border-gray-200 p-5 animate-fade"><p className="text-xs font-bold text-gray-500 uppercase tracking-wide">{s.label}</p><p className={`text-3xl font-bold mt-1 ${s.accent}`}>{s.value}</p><p className="text-xs text-gray-400 mt-0.5">{s.sub}</p></div>
+              ))}
+            </div>
+            <div className="space-y-3">
+              {groups.map(g => { const t=groupTasks[g.code]||[],d=t.filter(x=>x.status==="done").length,pct=t.length?Math.round((d/t.length)*100):0,od=t.filter(x=>x.status!=="done"&&isOverdue(x.due_date)).length; return (
+                <div key={g.code} onClick={()=>onViewGroup(g)} className="bg-white rounded-xl border border-gray-200 hover:border-gray-300 hover:shadow-md transition-all cursor-pointer p-5 animate-fade">
+                  <div className="flex items-center justify-between mb-3">
+                    <div><h3 className="font-bold text-gray-900">{g.name}</h3><p className="text-xs text-gray-500">{g.members.join(" \u2022 ")} | <span className="font-mono">{g.code}</span></p></div>
+                    <div className="text-right"><p className="text-2xl font-bold text-gray-800">{pct}%</p><p className="text-xs text-gray-400">complete</p></div>
+                  </div>
+                  <div className="w-full h-2 bg-gray-100 rounded-full overflow-hidden"><div className="h-full bg-emerald-400 rounded-full transition-all duration-500" style={{width:`${pct}%`}} /></div>
+                  <div className="flex items-center gap-4 mt-2 text-xs text-gray-500">
+                    <span>{t.length} tasks</span><span>{t.filter(x=>x.status==="in-progress").length} in progress</span><span>{d} done</span>
+                    {od>0&&<span className="text-red-500 font-semibold">{od} overdue</span>}
+                  </div>
+                </div>
+              ); })}
+              {groups.length===0&&<div className="text-center py-16 text-gray-400"><p className="text-lg font-semibold">No groups yet</p><p className="text-sm mt-1">Groups will appear once students create them.</p></div>}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── Landing ───
+    function LandingPage({ onJoinGroup, onLecturerLogin }) {
+      const [code, setCode] = useState(""); const [loading, setLoading] = useState(false);
+      const handleJoin = async () => { const t=code.trim().toUpperCase(); if(!t) return; if(t===LECTURER_CODE){onLecturerLogin();return;} setLoading(true); const g=await dbGetGroup(t); setLoading(false); onJoinGroup(t,g); };
+      return (
+        <div className="min-h-screen bg-gradient-to-br from-slate-50 via-white to-sky-50 flex items-center justify-center p-4">
+          <div className="text-center max-w-sm w-full animate-fade">
+            <div className="mb-8">
+              <div className="w-16 h-16 bg-gray-900 rounded-2xl flex items-center justify-center mx-auto mb-5 shadow-lg"><svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" /></svg></div>
+              <h1 className="text-2xl font-bold text-gray-900 tracking-tight">A02 Task Manager</h1>
+              <p className="text-sm text-gray-500 mt-2">Design Exploration | NYP SDM</p>
+            </div>
+            <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6">
+              <input value={code} onChange={e=>setCode(e.target.value.toUpperCase())} onKeyDown={e=>e.key==="Enter"&&handleJoin()} placeholder="Enter group code" className="w-full text-center px-4 py-3 rounded-xl border border-gray-200 focus:border-sky-400 focus:ring-2 focus:ring-sky-100 outline-none text-lg font-mono tracking-widest uppercase" maxLength={20} />
+              <button onClick={handleJoin} disabled={!code.trim()||loading} className="w-full mt-4 py-3 rounded-xl bg-gray-900 text-white font-bold text-sm hover:bg-gray-800 disabled:opacity-40 transition-all">{loading?"Checking...":"Enter"}</button>
+            </div>
+            <p className="text-xs text-gray-400 mt-6">First time? Enter a new code to create your group.</p>
+          </div>
+        </div>
+      );
+    }
+
+    // ─── App ───
+    function App() {
+      const [screen, setScreen] = useState("landing"); const [groupCode, setGroupCode] = useState(""); const [groupInfo, setGroupInfo] = useState(null);
+      if (!isConfigured) return <SetupInstructions />;
+      const handleJoinGroup = (code,existing) => { setGroupCode(code); if(existing){setGroupInfo(existing);setScreen("group");}else{setScreen("setup");} };
+      const handleLogout = () => { setScreen("landing"); setGroupCode(""); setGroupInfo(null); };
+      if (screen==="landing") return <LandingPage onJoinGroup={handleJoinGroup} onLecturerLogin={()=>setScreen("lecturer")} />;
+      if (screen==="setup") return <GroupSetup code={groupCode} onComplete={g=>{setGroupInfo(g);setScreen("group");}} />;
+      if (screen==="group") return <GroupWorkspace groupInfo={groupInfo} onLogout={handleLogout} isLecturer={false} />;
+      if (screen==="lecturer") return <LecturerDashboard onViewGroup={g=>{setGroupInfo(g);setScreen("lecturer-group");}} onLogout={handleLogout} />;
+      if (screen==="lecturer-group") return <GroupWorkspace groupInfo={groupInfo} onLogout={()=>setScreen("lecturer")} isLecturer={true} />;
+      return null;
+    }
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
